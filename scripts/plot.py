@@ -92,7 +92,7 @@ fig, axes = plt.subplots(1, 2, figsize=(15, 6.5))
 for ax, dim, size in zip(axes, ['2d', '3d'], ['1024²', '512³']):
     for mode in MODES:
         xs, ys, names = [], [], []
-        for model in MODELS:
+        for model in [m for m in MODELS if m != 'prospero']:
             c = compile_.get((model, dim, mode)); r = render.get((model, dim, mode))
             if c is None or r is None:
                 continue
@@ -101,15 +101,22 @@ for ax, dim, size in zip(axes, ['2d', '3d'], ['1024²', '512³']):
         for x, y, n in zip(xs, ys, names):
             ax.annotate(n, (x, y), textcoords='offset points', xytext=(6, 4), fontsize=8, color=COLORS[mode])
     # connect modes per model
-    for model in MODELS:
+    for model in [m for m in MODELS if m != 'prospero']:
         pts = [(compile_.get((model, dim, m)), render.get((model, dim, m))) for m in MODES]
         pts = [p for p in pts if None not in p]
         if len(pts) > 1:
             ax.plot(*zip(*pts), color='gray', lw=0.8, alpha=0.5, zorder=1)
     ax.set_xscale('log'); ax.set_yscale('log')
+    from matplotlib.ticker import FixedLocator, NullFormatter, FuncFormatter
+    ax.xaxis.set_major_locator(FixedLocator([0.2, 0.5, 1, 2, 5, 10]))
+    ax.xaxis.set_minor_formatter(NullFormatter())
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+    ax.yaxis.set_major_locator(FixedLocator([0.3, 0.5, 1, 2, 5, 10, 20]))
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     ax.set_xlabel("cold pipeline compile time (s)  →  worse")
     ax.set_ylabel("warm render time (ms)  →  worse")
-    ax.set_title(f"{dim.upper()} ({size}): compile cost vs. runtime per model")
+    ax.set_title(f"{dim.upper()} ({size}): compile cost vs. runtime (prospero omitted)")
     ax.grid(True, which='both', alpha=0.25)
     ax.legend()
     ax.text(0.98, 0.02, "lower-left is better; gray lines join the\nsame model across execution modes",
