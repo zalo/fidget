@@ -103,6 +103,7 @@ use crate::{
         BufferSizeError, BufferType, FlexBuffer, ReadBuffer, buffer_ro,
         buffer_ro_dyn, buffer_rw,
     },
+    kernel::KernelProgram,
     shaders, tag,
 };
 use fidget_core::{
@@ -346,7 +347,7 @@ impl TileRenderSize {
 }
 
 /// Returns a shader for interval root tiles
-fn interval_root_shader(reg_count: u8) -> String {
+pub(crate) fn interval_root_shader(reg_count: u8, k: &str) -> String {
     let mut shader_code = shaders::opcode_constants();
     shader_code += &format!("const REG_COUNT: u32 = {reg_count};");
     shader_code += COMMON_SHADER;
@@ -356,6 +357,7 @@ fn interval_root_shader(reg_count: u8) -> String {
     shader_code += shaders::INTERVAL_OPS;
     shader_code += shaders::COMMON;
     shader_code += shaders::TAPE_INTERPRETER;
+    shader_code += k; // kernels
     shader_code += shaders::STACK;
     shader_code += shaders::TAPE_SIMPLIFY;
     shader_code
@@ -380,7 +382,7 @@ fn sort_shader() -> String {
 }
 
 /// Returns a shader for interval tile evaluation
-fn interval_tiles_shader(reg_count: u8) -> String {
+pub(crate) fn interval_tiles_shader(reg_count: u8, k: &str) -> String {
     let mut shader_code = shaders::opcode_constants();
     shader_code += &format!("const REG_COUNT: u32 = {reg_count};");
     shader_code += INTERVAL_TILES_SHADER;
@@ -390,13 +392,14 @@ fn interval_tiles_shader(reg_count: u8) -> String {
     shader_code += shaders::INTERVAL_OPS;
     shader_code += shaders::COMMON;
     shader_code += shaders::TAPE_INTERPRETER;
+    shader_code += k; // kernels
     shader_code += shaders::STACK;
     shader_code += shaders::TAPE_SIMPLIFY;
     shader_code
 }
 
 /// Returns a shader for voxel tile evaluation
-fn voxel_tiles_shader(reg_count: u8) -> String {
+pub(crate) fn voxel_tiles_shader(reg_count: u8, k: &str) -> String {
     let mut shader_code = shaders::opcode_constants();
     shader_code += &format!("const REG_COUNT: u32 = {reg_count};");
     shader_code += VOXEL_TILES_SHADER;
@@ -405,12 +408,13 @@ fn voxel_tiles_shader(reg_count: u8) -> String {
     shader_code += shaders::FLOAT_OPS;
     shader_code += shaders::COMMON;
     shader_code += shaders::TAPE_INTERPRETER;
+    shader_code += k; // kernels
     shader_code += shaders::DUMMY_STACK;
     shader_code
 }
 
 /// Returns a shader for normals evaluation
-fn normals_shader(reg_count: u8) -> String {
+pub(crate) fn normals_shader(reg_count: u8, k: &str) -> String {
     let mut shader_code = shaders::opcode_constants();
     shader_code += &format!("const REG_COUNT: u32 = {reg_count};");
     shader_code += NORMALS_SHADER;
@@ -419,6 +423,7 @@ fn normals_shader(reg_count: u8) -> String {
     shader_code += shaders::GRAD_OPS;
     shader_code += shaders::COMMON;
     shader_code += shaders::TAPE_INTERPRETER;
+    shader_code += k; // kernels
     shader_code += shaders::DUMMY_STACK;
     shader_code
 }
@@ -479,22 +484,26 @@ impl RootContext {
                 immediate_size: 0u32,
             });
         let device_ = device.clone();
-        let root_pipeline = RegPipeline::build(Box::new(move |reg_count| {
-            let shader_code = interval_root_shader(reg_count);
-            let shader_module =
-                device_.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("interval root"),
-                    source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-                });
-            device_.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("interval root ({reg_count})")),
-                layout: Some(&pipeline_layout),
-                module: &shader_module,
-                entry_point: Some("interval_root_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        }));
+        let root_pipeline =
+            RegPipeline::build_with_kernels(Box::new(move |reg_count, k| {
+                let shader_code = interval_root_shader(reg_count, k);
+                let shader_module = device_.create_shader_module(
+                    wgpu::ShaderModuleDescriptor {
+                        label: Some("interval root"),
+                        source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+                    },
+                );
+                device_.create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some(&format!("interval root ({reg_count})")),
+                        layout: Some(&pipeline_layout),
+                        module: &shader_module,
+                        entry_point: Some("interval_root_main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    },
+                )
+            }));
 
         Self {
             bind_group_layout,
@@ -507,11 +516,12 @@ impl RootContext {
         ctx: &Context,
         workspace: &Workspace,
         reg_count: u8,
+        kernels: Option<&KernelProgram>,
         render_size: TileRenderSize,
         compute_pass: &mut wgpu::ComputePass,
     ) {
         let bind_group = workspace.bind_groups.root(ctx, workspace);
-        compute_pass.set_pipeline(self.root_pipeline.get(reg_count));
+        compute_pass.set_pipeline(&self.root_pipeline.get(reg_count, kernels));
         compute_pass.set_bind_group(1, bind_group, &[]);
 
         // Workgroup is 4x4x4, so we divide by 4 here on each axis
@@ -656,8 +666,8 @@ impl IntervalContext {
         let device_ = device.clone();
         let interval_pipeline_layout_ = interval_pipeline_layout.clone();
         let interval64_pipeline =
-            RegPipeline::build(Box::new(move |reg_count| {
-                let shader_code = interval_tiles_shader(reg_count);
+            RegPipeline::build_with_kernels(Box::new(move |reg_count, k| {
+                let shader_code = interval_tiles_shader(reg_count, k);
                 // SAFETY: the shader is carefully written
                 let shader_module = unsafe {
                     device_.create_shader_module_trusted(
@@ -698,8 +708,8 @@ impl IntervalContext {
 
         let device_ = device.clone();
         let interval16_pipeline =
-            RegPipeline::build(Box::new(move |reg_count| {
-                let shader_code = interval_tiles_shader(reg_count);
+            RegPipeline::build_with_kernels(Box::new(move |reg_count, k| {
+                let shader_code = interval_tiles_shader(reg_count, k);
                 // SAFETY: the shader is carefully written
                 let shader_module = unsafe {
                     device_.create_shader_module_trusted(
@@ -815,13 +825,15 @@ impl IntervalContext {
         workspace: &Workspace,
         strata: u64,
         reg_count: u8,
+        kernels: Option<&KernelProgram>,
         compute_pass: &mut wgpu::ComputePass,
     ) {
         let strata_bytes =
             u64::try_from(workspace.strata_size_bytes()).unwrap();
         let offset_bytes = strata * strata_bytes;
         let bind_group16 = workspace.bind_groups.interval16(ctx, workspace);
-        compute_pass.set_pipeline(self.interval64_pipeline.get(reg_count));
+        compute_pass
+            .set_pipeline(&self.interval64_pipeline.get(reg_count, kernels));
         compute_pass.set_bind_group(
             1,
             bind_group16,
@@ -839,7 +851,8 @@ impl IntervalContext {
             .dispatch_workgroups_indirect(workspace.tile16.tiles.data(), 0);
 
         let bind_group4 = workspace.bind_groups.interval4(ctx, workspace);
-        compute_pass.set_pipeline(self.interval16_pipeline.get(reg_count));
+        compute_pass
+            .set_pipeline(&self.interval16_pipeline.get(reg_count, kernels));
         compute_pass.set_bind_group(1, bind_group4, &[0]);
         compute_pass
             .dispatch_workgroups_indirect(workspace.tile16.sorted.data(), 0);
@@ -888,33 +901,38 @@ impl VoxelContext {
                 immediate_size: 0u32,
             });
         let device_ = device.clone();
-        let voxel_pipeline = RegPipeline::build(Box::new(move |reg_count| {
-            let shader_code = voxel_tiles_shader(reg_count);
-            // SAFETY: The shader is careful, good luck
-            let shader_module = unsafe {
-                device_.create_shader_module_trusted(
-                    wgpu::ShaderModuleDescriptor {
-                        label: Some("voxel shader module"),
-                        source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-                    },
-                    wgpu::ShaderRuntimeChecks {
-                        bounds_checks: false,
-                        force_loop_bounding: false,
-                        ray_query_initialization_tracking: false,
-                        task_shader_dispatch_tracking: false,
-                        mesh_shader_primitive_indices_clamp: false,
+        let voxel_pipeline =
+            RegPipeline::build_with_kernels(Box::new(move |reg_count, k| {
+                let shader_code = voxel_tiles_shader(reg_count, k);
+                // SAFETY: The shader is careful, good luck
+                let shader_module = unsafe {
+                    device_.create_shader_module_trusted(
+                        wgpu::ShaderModuleDescriptor {
+                            label: Some("voxel shader module"),
+                            source: wgpu::ShaderSource::Wgsl(
+                                shader_code.into(),
+                            ),
+                        },
+                        wgpu::ShaderRuntimeChecks {
+                            bounds_checks: false,
+                            force_loop_bounding: false,
+                            ray_query_initialization_tracking: false,
+                            task_shader_dispatch_tracking: false,
+                            mesh_shader_primitive_indices_clamp: false,
+                        },
+                    )
+                };
+                device_.create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some(&format!("voxels ({reg_count})")),
+                        layout: Some(&pipeline_layout),
+                        module: &shader_module,
+                        entry_point: Some("voxel_ray_main"),
+                        compilation_options: Default::default(),
+                        cache: None,
                     },
                 )
-            };
-            device_.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("voxels ({reg_count})")),
-                layout: Some(&pipeline_layout),
-                module: &shader_module,
-                entry_point: Some("voxel_ray_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        }));
+            }));
 
         Self {
             bind_group_layout,
@@ -927,10 +945,11 @@ impl VoxelContext {
         ctx: &Context,
         workspace: &Workspace,
         reg_count: u8,
+        kernels: Option<&KernelProgram>,
         compute_pass: &mut wgpu::ComputePass,
     ) {
         let bind_group = workspace.bind_groups.voxel(ctx, workspace);
-        compute_pass.set_pipeline(self.voxel_pipeline.get(reg_count));
+        compute_pass.set_pipeline(&self.voxel_pipeline.get(reg_count, kernels));
         compute_pass.set_bind_group(1, bind_group, &[]);
 
         // Each workgroup is 4x4x4, i.e. covering a 4x4 splat of pixels with 4x
@@ -973,22 +992,26 @@ impl NormalsContext {
                 immediate_size: 0u32,
             });
         let device_ = device.clone();
-        let normals_pipeline = RegPipeline::build(Box::new(move |reg_count| {
-            let shader_code = normals_shader(reg_count);
-            let shader_module =
-                device_.create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("normals shader module"),
-                    source: wgpu::ShaderSource::Wgsl(shader_code.into()),
-                });
-            device_.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(&format!("normals ({reg_count})")),
-                layout: Some(&pipeline_layout),
-                module: &shader_module,
-                entry_point: Some("normals_main"),
-                compilation_options: Default::default(),
-                cache: None,
-            })
-        }));
+        let normals_pipeline =
+            RegPipeline::build_with_kernels(Box::new(move |reg_count, k| {
+                let shader_code = normals_shader(reg_count, k);
+                let shader_module = device_.create_shader_module(
+                    wgpu::ShaderModuleDescriptor {
+                        label: Some("normals shader module"),
+                        source: wgpu::ShaderSource::Wgsl(shader_code.into()),
+                    },
+                );
+                device_.create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some(&format!("normals ({reg_count})")),
+                        layout: Some(&pipeline_layout),
+                        module: &shader_module,
+                        entry_point: Some("normals_main"),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    },
+                )
+            }));
 
         Self {
             bind_group_layout,
@@ -1001,10 +1024,12 @@ impl NormalsContext {
         ctx: &Context,
         workspace: &Workspace,
         reg_count: u8,
+        kernels: Option<&KernelProgram>,
         compute_pass: &mut wgpu::ComputePass,
     ) {
         let bind_group = workspace.bind_groups.normals(ctx, workspace);
-        compute_pass.set_pipeline(self.normals_pipeline.get(reg_count));
+        compute_pass
+            .set_pipeline(&self.normals_pipeline.get(reg_count, kernels));
         compute_pass.set_bind_group(1, bind_group, &[]);
 
         compute_pass.dispatch_workgroups(
@@ -2227,6 +2252,7 @@ impl Context {
             self,
             workspace,
             shape.bytecode.reg_count(),
+            shape.kernels(),
             render_size,
             &mut compute_pass,
         );
@@ -2242,12 +2268,14 @@ impl Context {
                 workspace,
                 strata,
                 shape.bytecode.reg_count(),
+                shape.kernels(),
                 &mut compute_pass,
             );
             self.voxel_ctx.run(
                 self,
                 workspace,
                 shape.bytecode.reg_count(),
+                shape.kernels(),
                 &mut compute_pass,
             );
 
@@ -2257,6 +2285,7 @@ impl Context {
                 self,
                 workspace,
                 shape.bytecode.reg_count(),
+                shape.kernels(),
                 &mut compute_pass,
             );
 
@@ -2458,22 +2487,34 @@ mod test {
 
     #[test]
     fn compile_interval_root_shader() {
-        crate::compile_shader(&interval_root_shader(16), "interval root");
+        crate::compile_shader(
+            &interval_root_shader(16, crate::kernel::KERNEL_STUB),
+            "interval root",
+        );
     }
 
     #[test]
     fn compile_interval_tiles_shader() {
-        crate::compile_shader(&interval_tiles_shader(16), "interval tiles");
+        crate::compile_shader(
+            &interval_tiles_shader(16, crate::kernel::KERNEL_STUB),
+            "interval tiles",
+        );
     }
 
     #[test]
     fn compile_voxel_tiles_shader() {
-        crate::compile_shader(&voxel_tiles_shader(16), "voxel tiles");
+        crate::compile_shader(
+            &voxel_tiles_shader(16, crate::kernel::KERNEL_STUB),
+            "voxel tiles",
+        );
     }
 
     #[test]
     fn compile_normals_shader() {
-        crate::compile_shader(&normals_shader(16), "normals tiles");
+        crate::compile_shader(
+            &normals_shader(16, crate::kernel::KERNEL_STUB),
+            "normals tiles",
+        );
     }
 
     #[test]

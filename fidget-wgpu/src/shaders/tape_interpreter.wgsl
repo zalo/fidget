@@ -47,7 +47,9 @@ fn run_tape(start: u32, xyz: array<Value, 3>, stack: ptr<function, Stack>) -> Ta
                     tmp = xyz[1u];
                 } else if imm_u == config.axes.z {
                     tmp = xyz[2u];
-                } else {
+                } else if !kernel_input(imm_u, xyz, &tmp) {
+                    // Not a compiled kernel (see `kernel.rs`), so this is a
+                    // variable
                     tmp = build_imm(var_values[imm_u]);
                 }
             }

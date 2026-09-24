@@ -1700,6 +1700,7 @@ dependencies = [
 name = "fidget-wgpu"
 version = "0.5.1"
 dependencies = [
+ "criterion",
  "facet",
  "fidget-bytecode",
  "fidget-core",

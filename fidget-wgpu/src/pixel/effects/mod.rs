@@ -48,6 +48,7 @@ fn color_shader(reg_count: u8) -> String {
         + super::DISTANCE_PIXEL_SHADER
         + shaders::COMMON
         + shaders::TAPE_INTERPRETER
+        + crate::kernel::KERNEL_STUB
         + shaders::DUMMY_STACK
         + shaders::FLOAT_OPS
 }
@@ -588,8 +589,9 @@ impl ColorContext {
                 })
             });
             compute_pass.set_bind_group(1, image_bg, &[]);
-            compute_pass
-                .set_pipeline(self.color_pipeline.get(shape.reg_count()));
+            compute_pass.set_pipeline(
+                &self.color_pipeline.get(shape.reg_count(), None),
+            );
             compute_pass.dispatch_workgroups(
                 size.width().div_ceil(8),
                 size.height().div_ceil(8),

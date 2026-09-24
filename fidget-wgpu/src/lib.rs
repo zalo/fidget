@@ -65,6 +65,7 @@
 
 use fidget_bytecode::{Bytecode, ReservedRegister};
 use fidget_core::{
+    context::Tree,
     eval::Function,
     shape::{MissingVar, ShapeVars},
     var::{Var, VarMap},
@@ -77,6 +78,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes};
 
 pub mod buf;
 pub mod color;
+pub mod kernel;
 pub mod pixel;
 pub mod voxel;
 
@@ -356,34 +358,91 @@ impl Gpu {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-/// Container of multiple pipelines, parameterized by register count
+/// Container of multiple pipelines, parameterized by register count and
+/// (optionally) compiled kernels
+///
+/// Pipelines are built lazily.  Interpreter-only pipelines are shared by every
+/// shape; pipelines with kernels are cached by the kernel source (so shapes
+/// with identical kernels share pipelines), keeping the most recently used
+/// [`MAX_KERNEL_PROGRAMS`] programs.
 pub(crate) struct RegPipeline {
-    thunk: Box<dyn Fn(u8) -> wgpu::ComputePipeline>,
-    cache:
-        [std::cell::OnceCell<wgpu::ComputePipeline>; REG_PIPELINE_SIZES.len()],
+    thunk: PipelineBuilder,
+    cache: RegPipelineCache,
+    kernels: std::cell::RefCell<Vec<(u64, RegPipelineCache)>>,
 }
+
+/// Function which builds a pipeline, given a register count and the source of
+/// `kernel_input`
+type PipelineBuilder = Box<dyn Fn(u8, &str) -> wgpu::ComputePipeline>;
+
+type RegPipelineCache =
+    [std::cell::OnceCell<wgpu::ComputePipeline>; REG_PIPELINE_SIZES.len()];
 
 const REG_PIPELINE_SIZES: &[u8] = &[8, 16, 32, 64, 128, 192, 255];
 
+/// Number of kernel programs whose pipelines are cached (per stage)
+pub const MAX_KERNEL_PROGRAMS: usize = 8;
+
 impl RegPipeline {
+    /// Builds a new pipeline container for a stage without kernels
     pub fn build(builder: Box<dyn Fn(u8) -> wgpu::ComputePipeline>) -> Self {
+        Self::build_with_kernels(Box::new(move |r, _| builder(r)))
+    }
+
+    /// Builds a new pipeline container for a stage which supports kernels
+    ///
+    /// `builder` is called with a register count and the source for
+    /// `kernel_input` (see [`kernel`]), which must be included in the shader
+    /// after the tape interpreter.
+    pub fn build_with_kernels(builder: PipelineBuilder) -> Self {
         Self {
             thunk: builder,
             cache: std::array::from_fn(|_| Default::default()),
+            kernels: Default::default(),
         }
     }
 
-    /// Returns the pipeline with sufficient registers to render `reg_count`
+    /// Returns the pipeline with sufficient registers to render `reg_count`,
+    /// including the given kernels
     ///
     /// # Panics
     /// If `reg_count` is 256 (which is not allowed in bytecode tapes)
-    pub fn get(&self, reg_count: u8) -> &wgpu::ComputePipeline {
+    pub fn get(
+        &self,
+        reg_count: u8,
+        program: Option<&kernel::KernelProgram>,
+    ) -> wgpu::ComputePipeline {
         let (i, r) = REG_PIPELINE_SIZES
             .iter()
             .enumerate()
             .find(|(_i, r)| reg_count <= **r)
             .expect("bytecode tape cannot use more than 255 registers");
-        self.cache[i].get_or_init(|| (*self.thunk)(*r))
+        let source = kernel::kernel_source(program);
+        let Some(program) = program else {
+            return self.cache[i]
+                .get_or_init(|| (*self.thunk)(*r, source))
+                .clone();
+        };
+        let mut kernels = self.kernels.borrow_mut();
+        let pos = match kernels.iter().position(|(k, _)| *k == program.key) {
+            Some(pos) => pos,
+            None => {
+                if kernels.len() >= MAX_KERNEL_PROGRAMS {
+                    kernels.remove(0);
+                }
+                kernels.push((
+                    program.key,
+                    std::array::from_fn(|_| Default::default()),
+                ));
+                kernels.len() - 1
+            }
+        };
+        // Move to the back (most recently used)
+        let entry = kernels.remove(pos);
+        kernels.push(entry);
+        kernels.last().unwrap().1[i]
+            .get_or_init(|| (*self.thunk)(*r, source))
+            .clone()
     }
 }
 
@@ -399,6 +458,8 @@ pub struct RenderShape {
     shape: VmShape,
     /// Serialized bytecode for the shape
     bytecode: Bytecode,
+    /// Compiled kernels used by the shape (see [`kernel`])
+    kernels: Option<std::sync::Arc<kernel::KernelProgram>>,
 }
 
 /// Error type when constructing a [`RenderShape`]
@@ -413,6 +474,9 @@ pub enum RenderShapeError {
     /// The shape uses a reserved register
     #[error(transparent)]
     RegisterError(#[from] ReservedRegister),
+    /// A kernel could not be compiled
+    #[error(transparent)]
+    KernelError(#[from] kernel::KernelError),
 }
 
 impl RenderShape {
@@ -427,7 +491,53 @@ impl RenderShape {
         Ok(Self {
             shape: shape.clone(),
             bytecode,
+            kernels: None,
         })
+    }
+
+    /// Builds a new render shape with compiled kernels
+    ///
+    /// `shape` should use the placeholders returned by
+    /// [`Kernels::compile`](kernel::Kernels::compile).  See the [`kernel`]
+    /// module for semantics and performance trade-offs.
+    pub fn with_kernels(
+        shape: &VmShape,
+        kernels: &kernel::Kernels,
+    ) -> Result<Self, RenderShapeError> {
+        Self::with_kernel_shapes(shape, &kernels.shapes())
+    }
+
+    fn with_kernel_shapes(
+        shape: &VmShape,
+        kernels: &[(Var, VmShape)],
+    ) -> Result<Self, RenderShapeError> {
+        let mut out = Self::new(shape)?;
+        out.kernels =
+            kernel::KernelProgram::build(shape.inner().vars(), kernels)?
+                .map(std::sync::Arc::new);
+        Ok(out)
+    }
+
+    /// Builds a new render shape which is compiled as a single kernel
+    ///
+    /// The whole shape is evaluated by straight-line code: this is fastest to
+    /// evaluate per point, but gives up tape simplification (see [`kernel`]).
+    pub fn compiled(shape: &VmShape) -> Result<Self, RenderShapeError> {
+        let v = Var::new();
+        Self::with_kernel_shapes(
+            &VmShape::from(Tree::from(v)),
+            &[(v, shape.clone())],
+        )
+    }
+
+    /// Returns `true` if the shape uses compiled kernels
+    pub fn has_kernels(&self) -> bool {
+        self.kernels.is_some()
+    }
+
+    /// Returns the compiled kernel program, if present
+    pub(crate) fn kernels(&self) -> Option<&kernel::KernelProgram> {
+        self.kernels.as_deref()
     }
 
     /// Helper function to return XYZ variable indices
@@ -447,7 +557,12 @@ impl RenderShape {
         vars: &ShapeVars<f32>,
         buf: &mut buf::FlexBuffer<voxel::VarsBufferTag>,
     ) -> Result<CopyVarsChanged, CopyVarsError> {
-        copy_vars(gpu, self.shape.inner().vars(), vars, buf)
+        let skip = self
+            .kernels
+            .as_ref()
+            .map(|k| k.inputs.as_slice())
+            .unwrap_or(&[]);
+        copy_vars_skipping(gpu, self.shape.inner().vars(), vars, buf, skip)
     }
 }
 
@@ -457,12 +572,25 @@ pub(crate) fn copy_vars(
     vars: &ShapeVars<f32>,
     buf: &mut buf::FlexBuffer<voxel::VarsBufferTag>,
 ) -> Result<CopyVarsChanged, CopyVarsError> {
+    copy_vars_skipping(gpu, vs, vars, buf, &[])
+}
+
+/// Copies variables, skipping the given indices (which are kernel
+/// placeholders, evaluated by compiled code rather than read from the buffer)
+fn copy_vars_skipping(
+    gpu: &Gpu,
+    vs: &VarMap,
+    vars: &ShapeVars<f32>,
+    buf: &mut buf::FlexBuffer<voxel::VarsBufferTag>,
+    skip: &[u32],
+) -> Result<CopyVarsChanged, CopyVarsError> {
     let mut changed = CopyVarsChanged::BufferUnchanged;
     if vs.has_free_vars() {
         // Do an initial pass to check for errors before resizing the buffer
-        for (v, _i) in vs.iter() {
+        for (v, i) in vs.iter() {
             match v {
                 Var::X | Var::Y | Var::Z => (),
+                Var::V(_) if skip.contains(&(i as u32)) => (),
                 Var::V(vi) => {
                     if vars.get(vi).is_none() {
                         return Err(MissingVar { var: vi }.into());
@@ -491,6 +619,7 @@ pub(crate) fn copy_vars(
         for (v, i) in vs.iter() {
             match v {
                 Var::X | Var::Y | Var::Z => (),
+                Var::V(_) if skip.contains(&(i as u32)) => (),
                 Var::V(vi) => {
                     let value = vars.get(vi).unwrap(); // checked above
                     let offset = i * std::mem::size_of::<f32>();
