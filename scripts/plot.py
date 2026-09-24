@@ -102,7 +102,7 @@ for ax, dim, size in zip(axes, ['2d', '3d'], ['1024²', '512³']):
             ax.annotate(n, (x, y), textcoords='offset points', xytext=(6, 4), fontsize=8, color=COLORS[mode])
     # connect modes per model
     for model in [m for m in MODELS if m != 'prospero']:
-        pts = [(compile_.get((model, dim, m)), render.get((model, dim, m))) for m in MODES]
+        pts = [(compile_.get((model, dim, m)), render.get((model, dim, m))) for m in ('interpreted', 'leaves', 'compiled')]
         pts = [p for p in pts if None not in p]
         if len(pts) > 1:
             ax.plot(*zip(*pts), color='gray', lw=0.8, alpha=0.5, zorder=1)
@@ -119,7 +119,7 @@ for ax, dim, size in zip(axes, ['2d', '3d'], ['1024²', '512³']):
     ax.set_title(f"{dim.upper()} ({size}): compile cost vs. runtime (prospero omitted)")
     ax.grid(True, which='both', alpha=0.25)
     ax.legend()
-    ax.text(0.98, 0.02, "lower-left is better; gray lines join the\nsame model across execution modes",
+    ax.text(0.98, 0.02, "lower-left is better; gray lines join each model:\ninterpreter → leaf kernels → whole-shape kernel",
             ha='right',
             transform=ax.transAxes, fontsize=8, color='gray')
 fig.tight_layout()
