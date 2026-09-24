@@ -28,4 +28,9 @@ wgpu.workspace = true
 zerocopy.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 facet.workspace = true
+
+[[bench]]
+name = "kernels"
+harness = false

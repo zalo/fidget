@@ -87,6 +87,15 @@ This section may not be all-inclusive; sorry!  I _did_ warn you that
   threads).
 - Rename the workspace buffer objects from `Buffers` to `Workspace` (e.g.
   `fidget::wgpu::voxel::Buffers`) to more clearly reflect their usage.
+- Add compiled kernels (`fidget::wgpu::kernel`): subexpressions marked with
+  `Kernels::compile` are compiled to straight-line WGSL functions, which the
+  tape interpreter calls in place of an input variable.  Build shapes with
+  `RenderShape::with_kernels`, or `RenderShape::compiled` to compile an entire
+  shape; `Kernels::compile_leaves` compiles each choice-free subexpression
+  while keeping CSG operations interpreted.  Pipelines for each distinct set of
+  kernels are built lazily and cached by source.  Kernels resolve register
+  spills at compile time, so shapes which are too large for the interpreter
+  (e.g. `models/prospero.vm`) can be rendered with them.
 
 # 0.5.0
 This is a large release with a bunch of small features, reorganization, and one
